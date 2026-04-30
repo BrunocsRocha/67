@@ -1,1 +1,3 @@
-pip install opencv-python mediapipe numpy
+opencv-python
+mediapipe
+numpy
