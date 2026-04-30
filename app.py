@@ -1,21 +1,158 @@
 # pip install opencv-python numpy ultralytics torch
 
 import os
+import sys
 import json
+import math
 import cv2
 import numpy as np
 import time
 from collections import deque
 from datetime import date
+from typing import Dict, Optional, Tuple
 
-import config as cfg
-from tracker import PoseTracker
-from utils import (
-    KeypointSmoother,
-    filter_keypoints,
-    shoulder_distance,
-    estimate_hand_box,
-)
+import torch
+from ultralytics import YOLO
+
+# =============================================================================
+#  Configuracoes (antes em config.py)
+# =============================================================================
+WEBCAM_INDEX = 0
+CAPTURE_WIDTH = 1280
+CAPTURE_HEIGHT = 720
+MIRROR_MODE = True
+
+YOLO_MODEL = "yolov8n-pose.pt"
+YOLO_IMGSZ = 640
+YOLO_CONF = 0.40
+YOLO_IOU = 0.50
+YOLO_DEVICE = "auto"
+
+MIN_KP_CONFIDENCE = 0.45
+SMOOTHING_ALPHA = 0.45
+HAND_BOX_SCALE = 0.30
+
+COLOR_KEYPOINT = (0, 255, 200)
+COLOR_SKELETON = (255, 180, 50)
+COLOR_HAND_BOX = (80, 220, 255)
+KEYPOINT_RADIUS = 6
+SKELETON_THICKNESS = 3
+HAND_BOX_THICKNESS = 2
+
+# =============================================================================
+#  PoseTracker (antes em tracker.py)
+# =============================================================================
+_COCO_KP_NAMES = {
+    0: "nose", 1: "left_eye", 2: "right_eye", 3: "left_ear", 4: "right_ear",
+    5: "left_shoulder", 6: "right_shoulder", 7: "left_elbow", 8: "right_elbow",
+    9: "left_wrist", 10: "right_wrist", 11: "left_hip", 12: "right_hip",
+    13: "left_knee", 14: "right_knee", 15: "left_ankle", 16: "right_ankle",
+}
+_REQUIRED_NAMES = {
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+    "left_hip", "right_hip",
+}
+
+
+class PoseTracker:
+    def __init__(self):
+        device = YOLO_DEVICE if YOLO_DEVICE != "auto" else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"[tracker] Loading {YOLO_MODEL} on device={device}")
+        self.model = YOLO(YOLO_MODEL)
+        self.device = device
+
+    def process(self, frame):
+        results = self.model.predict(
+            source=frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF,
+            iou=YOLO_IOU, device=self.device, verbose=False, max_det=5,
+        )
+        if not results or results[0].keypoints is None:
+            return None
+        kps_data = results[0].keypoints
+        boxes = results[0].boxes
+        if kps_data.xy is None or len(kps_data.xy) == 0:
+            return None
+        best_idx = self._select_person(boxes)
+        if best_idx is None:
+            return None
+        xy = kps_data.xy[best_idx].cpu().numpy()
+        conf = kps_data.conf[best_idx].cpu().numpy()
+        out = {}
+        for idx, name in _COCO_KP_NAMES.items():
+            if name in _REQUIRED_NAMES:
+                out[name] = (float(xy[idx, 0]), float(xy[idx, 1]), float(conf[idx]))
+        return out
+
+    @staticmethod
+    def _select_person(boxes):
+        if boxes is None or len(boxes) == 0:
+            return None
+        confs = boxes.conf.cpu().numpy()
+        xyxy = boxes.xyxy.cpu().numpy()
+        areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+        max_area = areas.max() if areas.max() > 0 else 1.0
+        scores = confs * 0.6 + (areas / max_area) * 0.4
+        return int(np.argmax(scores))
+
+
+# =============================================================================
+#  Utils (antes em utils.py)
+# =============================================================================
+def filter_keypoints(raw):
+    return {name: (x, y) for name, (x, y, c) in raw.items() if c >= MIN_KP_CONFIDENCE}
+
+
+class KeypointSmoother:
+    def __init__(self, alpha=SMOOTHING_ALPHA):
+        self.alpha = alpha
+        self._state = {}
+
+    def smooth(self, keypoints):
+        result = {}
+        for name, (x, y) in keypoints.items():
+            cur = np.array([x, y], dtype=np.float64)
+            if name in self._state:
+                smoothed = self.alpha * self._state[name] + (1.0 - self.alpha) * cur
+            else:
+                smoothed = cur
+            self._state[name] = smoothed
+            result[name] = (float(smoothed[0]), float(smoothed[1]))
+        self._state = {k: v for k, v in self._state.items() if k in keypoints}
+        return result
+
+    def reset(self):
+        self._state.clear()
+
+
+def _distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _unit_vector(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    mag = math.hypot(dx, dy)
+    if mag < 1e-6:
+        return None
+    return (dx / mag, dy / mag)
+
+
+def shoulder_distance(kps):
+    ls, rs = kps.get("left_shoulder"), kps.get("right_shoulder")
+    if ls is None or rs is None:
+        return None
+    return _distance(ls, rs)
+
+
+def estimate_hand_box(wrist, elbow, body_scale, scale=HAND_BOX_SCALE):
+    half = max(int(body_scale * scale / 2), 8)
+    uv = _unit_vector(elbow, wrist)
+    if uv is not None:
+        cx = wrist[0] + uv[0] * half * 0.5
+        cy = wrist[1] + uv[1] * half * 0.5
+    else:
+        cx, cy = wrist
+    return (int(cx - half), int(cy - half)), (int(cx + half), int(cy + half))
 
 # =============================================================================
 #  Caminhos
@@ -159,22 +296,24 @@ def draw_skeleton_yolo(frame, kps):
         b = kps.get(b_name)
         if a is not None and b is not None:
             cv2.line(frame, _int_pt(a), _int_pt(b),
-                     cfg.COLOR_SKELETON, cfg.SKELETON_THICKNESS, cv2.LINE_AA)
+                     COLOR_SKELETON, SKELETON_THICKNESS, cv2.LINE_AA)
 
     for name, pt in kps.items():
-        color = cfg.COLOR_HAND_BOX if "wrist" in name else cfg.COLOR_KEYPOINT
-        cv2.circle(frame, _int_pt(pt), cfg.KEYPOINT_RADIUS, color, -1, cv2.LINE_AA)
+        if "nose" in name or "eye" in name or "ear" in name:
+            continue  # Nao desenhar ponto no rosto
+        color = COLOR_HAND_BOX if "wrist" in name else COLOR_KEYPOINT
+        cv2.circle(frame, _int_pt(pt), KEYPOINT_RADIUS, color, -1, cv2.LINE_AA)
 
 
 def draw_hand_boxes_yolo(frame, kps, body_scale):
-    """Desenha caixas estimadas das mãos."""
+    """Desenha caixas estimadas das maos."""
     for side in ("left", "right"):
         wrist = kps.get(f"{side}_wrist")
         elbow = kps.get(f"{side}_elbow")
         if wrist is not None and elbow is not None:
             tl, br = estimate_hand_box(wrist, elbow, body_scale)
-            cv2.rectangle(frame, tl, br, cfg.COLOR_HAND_BOX,
-                          cfg.HAND_BOX_THICKNESS, cv2.LINE_AA)
+            cv2.rectangle(frame, tl, br, COLOR_HAND_BOX,
+                          HAND_BOX_THICKNESS, cv2.LINE_AA)
 
 
 # =============================================================================
@@ -399,11 +538,11 @@ def draw_results_screen(frame, records, player_name, player_score):
 def main():
     # ── Inicializar YOLO Pose tracker + smoother ──
     tracker = PoseTracker()
-    smoother = KeypointSmoother(alpha=cfg.SMOOTHING_ALPHA)
+    smoother = KeypointSmoother(alpha=SMOOTHING_ALPHA)
 
-    webcam = cv2.VideoCapture(0)
-    webcam.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.CAPTURE_WIDTH)
-    webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.CAPTURE_HEIGHT)
+    webcam = cv2.VideoCapture(WEBCAM_INDEX)
+    webcam.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
 
     # Configurar janela em tela cheia
     window_name = "Six Seven Challenge"
@@ -437,7 +576,7 @@ def main():
         if not success:
             continue
 
-        if cfg.MIRROR_MODE:
+        if MIRROR_MODE:
             frame = cv2.flip(frame, 1)
 
         # Redimensionar frame para preencher a tela
