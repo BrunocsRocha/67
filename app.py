@@ -1,60 +1,26 @@
-# pip install opencv-python mediapipe numpy
+# pip install opencv-python numpy ultralytics torch
 
 import os
 import json
-import urllib.request
 import cv2
 import numpy as np
-import mediapipe as mp
 import time
 from collections import deque
 from datetime import date
 
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-
-# =============================================================================
-#  Baixar modelo PoseLandmarker (Lite — otimizado para CPU)
-# =============================================================================
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "pose_landmarker/pose_landmarker_lite/float16/latest/"
-    "pose_landmarker_lite.task"
+import config as cfg
+from tracker import PoseTracker
+from utils import (
+    KeypointSmoother,
+    filter_keypoints,
+    shoulder_distance,
+    estimate_hand_box,
 )
-_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "mediapipe")
-os.makedirs(_CACHE_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(_CACHE_DIR, "pose_landmarker_lite.task")
+
+# =============================================================================
+#  Caminhos
+# =============================================================================
 RECORDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "six_seven_records.json")
-
-if not os.path.exists(MODEL_PATH):
-    print(f"Baixando modelo de {MODEL_URL} ...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print(f"Download concluído! Salvo em: {MODEL_PATH}")
-
-# =============================================================================
-#  Índices dos landmarks do MediaPipe Pose (33 pontos)
-# =============================================================================
-LEFT_WRIST = 15
-RIGHT_WRIST = 16
-LEFT_SHOULDER = 11
-RIGHT_SHOULDER = 12
-LEFT_HIP = 23
-RIGHT_HIP = 24
-
-# =============================================================================
-#  Constantes de estado do gesto
-# =============================================================================
-NEUTRAL = "NEUTRAL"
-A_UP_B_DOWN = "L_UP_R_DOWN"
-B_UP_A_DOWN = "R_UP_L_DOWN"
-BOTH_UP = "BOTH_UP"
-
-STATE_COLORS = {
-    NEUTRAL:     (160, 160, 160),
-    A_UP_B_DOWN: (255, 140, 0),
-    B_UP_A_DOWN: (0, 140, 255),
-    BOTH_UP:     (0, 0, 255),
-}
 
 # =============================================================================
 #  Constantes de tela
@@ -64,47 +30,89 @@ SCREEN_GAME = "GAME"
 SCREEN_RESULTS = "RESULTS"
 
 GAME_DURATION_SEC = 60
+FLASH_DURATION_SEC = 0.6
 
 # =============================================================================
-#  Parâmetros do detector de gesto (otimizados para sensibilidade)
+#  Parâmetros do detector de gesto (original wrist-based)
 # =============================================================================
+NEUTRAL = "NEUTRAL"
+A_UP_B_DOWN = "L_UP_R_DOWN"
+B_UP_A_DOWN = "R_UP_L_DOWN"
+
 DEBOUNCE_SEC = 0.08
 MAX_CYCLE_WINDOW_SEC = 3.0
 RHYTHM_TOLERANCE = 0.70
 MIN_TRANSITIONS = 2
-FLASH_DURATION_SEC = 0.6
-MIN_VISIBILITY = 0.35
-MIN_WRIST_MOVEMENT = 0.03  # Movimento mínimo de cada pulso (3% da altura normalizada)
+MIN_WRIST_MOVEMENT = 3.0  # Movimento mínimo em pixels
+
+STATE_COLORS = {
+    NEUTRAL:     (160, 160, 160),
+    A_UP_B_DOWN: (255, 140, 0),
+    B_UP_A_DOWN: (0, 140, 255),
+}
 
 # =============================================================================
-#  Estado global (atualizado pelo callback do LIVE_STREAM)
+#  Conexões do esqueleto (nomes COCO usados pelo YOLO)
 # =============================================================================
-latest_landmarks = None
-
-
-def on_result(result, output_image, timestamp_ms):
-    """Callback chamado pelo PoseLandmarker em modo LIVE_STREAM."""
-    global latest_landmarks
-    if result.pose_landmarks and len(result.pose_landmarks) > 0:
-        latest_landmarks = result.pose_landmarks[0]
-    else:
-        latest_landmarks = None
+_SKELETON_PAIRS = [
+    ("left_shoulder", "left_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow"),
+    ("right_elbow", "right_wrist"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_hip"),
+    ("right_shoulder", "right_hip"),
+    ("left_hip", "right_hip"),
+]
 
 
 # =============================================================================
-#  Criar PoseLandmarker
+#  Funções de detecção de gesto (original — baseada em pulsos)
 # =============================================================================
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    running_mode=vision.RunningMode.LIVE_STREAM,
-    num_poses=1,
-    min_pose_detection_confidence=0.5,
-    min_pose_presence_confidence=0.5,
-    min_tracking_confidence=0.5,
-    result_callback=on_result,
-)
-landmarker = vision.PoseLandmarker.create_from_options(options)
+def classify_frame_yolo(kps, frame_h):
+    """Classifica o frame baseado na posição Y relativa entre os dois pulsos.
+
+    Usa keypoints YOLO {name: (x, y)} com coordenadas em pixels.
+    Normaliza pelo frame_h para manter a mesma lógica do original.
+    """
+    wl = kps.get("left_wrist")
+    wr = kps.get("right_wrist")
+    if wl is None or wr is None:
+        return NEUTRAL
+
+    # Normalizar Y pelo height do frame (como o MediaPipe fazia)
+    wl_y = wl[1] / frame_h
+    wr_y = wr[1] / frame_h
+
+    # Margem de histerese (5% da altura normalizada)
+    MARGIN = 0.05
+    diff = wl_y - wr_y  # positivo = esquerdo mais baixo
+
+    if diff < -MARGIN:
+        return A_UP_B_DOWN   # Pulso esquerdo mais alto
+    if diff > MARGIN:
+        return B_UP_A_DOWN   # Pulso direito mais alto
+
+    return NEUTRAL
+
+
+def check_six_seven(trans):
+    """Verifica padrão rítmico alternado."""
+    if len(trans) < MIN_TRANSITIONS:
+        return False
+    last = list(trans)[-MIN_TRANSITIONS:]
+    if not all(last[i][0] != last[i + 1][0] for i in range(MIN_TRANSITIONS - 1)):
+        return False
+    if (last[-1][1] - last[0][1]) > MAX_CYCLE_WINDOW_SEC:
+        return False
+    intervals = [last[i + 1][1] - last[i][1] for i in range(MIN_TRANSITIONS - 1)]
+    avg = sum(intervals) / len(intervals)
+    if avg == 0:
+        return False
+    return all(
+        (1 - RHYTHM_TOLERANCE) * avg <= dt <= (1 + RHYTHM_TOLERANCE) * avg
+        for dt in intervals
+    )
 
 
 # =============================================================================
@@ -138,96 +146,41 @@ def update_records(records, name, score):
 
 
 # =============================================================================
-#  Funções de detecção de gesto
+#  Funções de desenho — esqueleto YOLO (coordenadas em pixels)
 # =============================================================================
-def classify_frame(landmarks):
-    """Classifica o frame baseado na posição relativa entre os dois pulsos.
-
-    Quando o pulso esquerdo está mais alto (menor Y) que o direito → L_UP_R_DOWN.
-    Quando o pulso direito está mais alto que o esquerdo → R_UP_L_DOWN.
-    Margem de histerese para evitar oscilação quando estão na mesma altura.
-    """
-    wl = landmarks[LEFT_WRIST]
-    wr = landmarks[RIGHT_WRIST]
-
-    if wl.visibility < MIN_VISIBILITY or wr.visibility < MIN_VISIBILITY:
-        return NEUTRAL
-
-    # Margem de histerese (5% da altura normalizada)
-    MARGIN = 0.05
-    diff = wl.y - wr.y  # positivo = esquerdo mais baixo, negativo = esquerdo mais alto
-
-    if diff < -MARGIN:
-        return A_UP_B_DOWN   # Pulso esquerdo mais alto
-    if diff > MARGIN:
-        return B_UP_A_DOWN   # Pulso direito mais alto
-
-    return NEUTRAL
+def _int_pt(p):
+    return (int(round(p[0])), int(round(p[1])))
 
 
-def check_six_seven(trans):
-    """Verifica padrão rítmico alternado."""
-    if len(trans) < MIN_TRANSITIONS:
-        return False
-    last = list(trans)[-MIN_TRANSITIONS:]
-    if not all(last[i][0] != last[i + 1][0] for i in range(MIN_TRANSITIONS - 1)):
-        return False
-    if (last[-1][1] - last[0][1]) > MAX_CYCLE_WINDOW_SEC:
-        return False
-    intervals = [last[i + 1][1] - last[i][1] for i in range(MIN_TRANSITIONS - 1)]
-    avg = sum(intervals) / len(intervals)
-    if avg == 0:
-        return False
-    return all(
-        (1 - RHYTHM_TOLERANCE) * avg <= dt <= (1 + RHYTHM_TOLERANCE) * avg
-        for dt in intervals
-    )
+def draw_skeleton_yolo(frame, kps):
+    """Desenha o esqueleto usando keypoints YOLO {name: (x,y)}."""
+    for a_name, b_name in _SKELETON_PAIRS:
+        a = kps.get(a_name)
+        b = kps.get(b_name)
+        if a is not None and b is not None:
+            cv2.line(frame, _int_pt(a), _int_pt(b),
+                     cfg.COLOR_SKELETON, cfg.SKELETON_THICKNESS, cv2.LINE_AA)
+
+    for name, pt in kps.items():
+        color = cfg.COLOR_HAND_BOX if "wrist" in name else cfg.COLOR_KEYPOINT
+        cv2.circle(frame, _int_pt(pt), cfg.KEYPOINT_RADIUS, color, -1, cv2.LINE_AA)
 
 
-# Conexões do esqueleto
-POSE_CONNECTIONS = [
-    (11, 12), (11, 13), (13, 15),
-    (12, 14), (14, 16), (11, 23),
-    (12, 24), (23, 24),
-]
+def draw_hand_boxes_yolo(frame, kps, body_scale):
+    """Desenha caixas estimadas das mãos."""
+    for side in ("left", "right"):
+        wrist = kps.get(f"{side}_wrist")
+        elbow = kps.get(f"{side}_elbow")
+        if wrist is not None and elbow is not None:
+            tl, br = estimate_hand_box(wrist, elbow, body_scale)
+            cv2.rectangle(frame, tl, br, cfg.COLOR_HAND_BOX,
+                          cfg.HAND_BOX_THICKNESS, cv2.LINE_AA)
 
 
 # =============================================================================
-#  Funções de desenho
+#  Funções de desenho — HUD e telas (mantidas do app.py original)
 # =============================================================================
-def draw_skeleton(frame, landmarks):
-    """Desenha o esqueleto sobre o frame."""
-    h, w = frame.shape[:2]
-    for i, j in POSE_CONNECTIONS:
-        p1, p2 = landmarks[i], landmarks[j]
-        if p1.visibility > 0.4 and p2.visibility > 0.4:
-            x1, y1 = int(p1.x * w), int(p1.y * h)
-            x2, y2 = int(p2.x * w), int(p2.y * h)
-            cv2.line(frame, (x1, y1), (x2, y2), (220, 220, 220), 2, cv2.LINE_AA)
-    for idx in [11, 12, 13, 14, 15, 16, 23, 24]:
-        lm = landmarks[idx]
-        if lm.visibility > 0.4:
-            x, y = int(lm.x * w), int(lm.y * h)
-            color = (0, 255, 255) if idx in (15, 16) else (50, 255, 50)
-            cv2.circle(frame, (x, y), 5, color, -1, cv2.LINE_AA)
-
-
-def draw_reference_lines(frame, landmarks):
-    """Desenha linhas de referência (ombros e peito)."""
-    h, w = frame.shape[:2]
-    sl, sr = landmarks[LEFT_SHOULDER], landmarks[RIGHT_SHOULDER]
-    hl, hr = landmarks[LEFT_HIP], landmarks[RIGHT_HIP]
-    shoulder_px = int((sl.y + sr.y) / 2 * h)
-    chest_px = int(((sl.y + sr.y) / 2 + (hl.y + hr.y) / 2) / 2 * h)
-    cv2.line(frame, (0, shoulder_px), (w, shoulder_px), (255, 200, 0), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Ombros", (w - 90, shoulder_px - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1, cv2.LINE_AA)
-    cv2.line(frame, (0, chest_px), (w, chest_px), (0, 200, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Peito", (w - 75, chest_px - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1, cv2.LINE_AA)
-
-
-def draw_game_hud(frame, state, gesture_count, buffer_len, flash_remaining,
+def draw_game_hud(frame, state_label, gesture_count, flash_remaining,
                   remaining_secs, player_name):
     """Desenha o HUD durante o jogo."""
     h, w = frame.shape[:2]
@@ -253,13 +206,9 @@ def draw_game_hud(frame, state, gesture_count, buffer_len, flash_remaining,
                 (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
 
     # Estado
-    color = STATE_COLORS.get(state, (255, 255, 255))
-    cv2.putText(frame, f"Estado: {state}",
+    color = STATE_COLORS.get(state_label, (255, 255, 255))
+    cv2.putText(frame, f"Estado: {state_label}",
                 (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
-    # Buffer
-    cv2.putText(frame, f"Buffer: {buffer_len}/{MIN_TRANSITIONS}",
-                (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
 
     # Timer (canto superior direito)
     mins = int(remaining_secs) // 60
@@ -344,75 +293,99 @@ def draw_results_screen(frame, records, player_name, player_score):
     cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 25), -1)
     cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
 
+    # Calcular layout baseado na altura da tela
+    header_zone_h = int(h * 0.25)
+    footer_zone_h = 100
+    table_zone_h = h - header_zone_h - footer_zone_h
+
     # Título
-    put_centered_text(frame, "RESULTADO", 55, 1.5, (0, 255, 255), 3)
+    title_y = int(header_zone_h * 0.35)
+    put_centered_text(frame, "RESULTADO", title_y, 1.5, (0, 255, 255), 3)
 
     # Score do jogador
+    score_y = int(header_zone_h * 0.60)
     put_centered_text(frame, f"{player_name}: {player_score} pontos",
-                      100, 0.9, (255, 255, 255), 2)
+                      score_y, 0.9, (255, 255, 255), 2)
 
     # Verificar se é novo recorde
     is_new_record = any(
         r["name"] == player_name and r["score"] == player_score for r in records[:10]
     )
     if is_new_record and player_score > 0:
-        put_centered_text(frame, "NOVO RECORDE!", 135, 0.8, (0, 255, 0), 2)
+        record_y = int(header_zone_h * 0.82)
+        put_centered_text(frame, "NOVO RECORDE!", record_y, 0.8, (0, 255, 0), 2)
 
     # Tabela de ranking
-    table_x = (w - 400) // 2
-    table_y = 160
-    row_h = 32
+    num_records = min(len(records), 10)
+    table_w = min(750, w - 40)
+    row_h = min(36, max(24, table_zone_h // (num_records + 2)))
+    table_x = (w - table_w) // 2
+    table_y = header_zone_h + 10
+
+    # Definir colunas com espaço suficiente para rank + medalhas
+    col_rank = table_x + 10
+    col_nome = table_x + int(table_w * 0.18)
+    col_score = table_x + int(table_w * 0.58)
+    col_data = table_x + int(table_w * 0.72)
 
     # Cabeçalho
-    cv2.rectangle(frame, (table_x, table_y), (table_x + 400, table_y + row_h),
+    cv2.rectangle(frame, (table_x, table_y), (table_x + table_w, table_y + row_h),
                   (50, 50, 80), -1)
-    cv2.putText(frame, "#", (table_x + 10, table_y + 22),
+    cv2.putText(frame, "#", (col_rank, table_y + row_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Nome", (table_x + 50, table_y + 22),
+    cv2.putText(frame, "Nome", (col_nome, table_y + row_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Score", (table_x + 250, table_y + 22),
+    cv2.putText(frame, "Score", (col_score, table_y + row_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Data", (table_x + 320, table_y + 22),
+    cv2.putText(frame, "Data", (col_data, table_y + row_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
 
     for i, rec in enumerate(records[:10]):
         ry = table_y + row_h * (i + 1)
+        if ry + row_h > h - footer_zone_h:
+            break
         is_current = (rec["name"] == player_name and rec["score"] == player_score)
 
         # Fundo da linha
         bg_color = (40, 80, 40) if is_current else ((35, 35, 50) if i % 2 == 0 else (25, 25, 40))
-        cv2.rectangle(frame, (table_x, ry), (table_x + 400, ry + row_h), bg_color, -1)
+        cv2.rectangle(frame, (table_x, ry), (table_x + table_w, ry + row_h), bg_color, -1)
 
         text_color = (0, 255, 200) if is_current else (220, 220, 220)
-        medal = ""
-        if i == 0:
-            medal = " [1st]"
-        elif i == 1:
-            medal = " [2nd]"
-        elif i == 2:
-            medal = " [3rd]"
 
-        cv2.putText(frame, f"{i + 1}{medal}", (table_x + 10, ry + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1, cv2.LINE_AA)
-        # Truncar nome se muito longo
-        display_n = rec["name"][:12]
-        cv2.putText(frame, display_n, (table_x + 50, ry + 22),
+        # Rank e medalha em colunas separadas
+        rank_text = str(i + 1)
+        medal_text = ""
+        if i == 0:
+            medal_text = "[1st]"
+        elif i == 1:
+            medal_text = "[2nd]"
+        elif i == 2:
+            medal_text = "[3rd]"
+
+        cv2.putText(frame, rank_text, (col_rank, ry + row_h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, str(rec["score"]), (table_x + 260, ry + 22),
+        if medal_text:
+            medal_color = (0, 215, 255) if i == 0 else ((192, 192, 192) if i == 1 else (80, 127, 205))
+            cv2.putText(frame, medal_text, (col_rank + 30, ry + row_h - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, medal_color, 1, cv2.LINE_AA)
+
+        # Nome — permitir até 15 caracteres
+        display_n = rec["name"][:15]
+        cv2.putText(frame, display_n, (col_nome, ry + row_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA)
+        cv2.putText(frame, str(rec["score"]), (col_score, ry + row_h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA)
         rec_date = rec.get("date", "")
-        cv2.putText(frame, rec_date, (table_x + 320, ry + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1, cv2.LINE_AA)
+        cv2.putText(frame, rec_date, (col_data, ry + row_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1, cv2.LINE_AA)
 
     # Botões
     btn_y = h - 80
-    # Jogar Novamente
     btn1_x = (w // 2) - 200
     cv2.rectangle(frame, (btn1_x, btn_y), (btn1_x + 180, btn_y + 45),
                   (0, 160, 140), -1, cv2.LINE_AA)
     cv2.putText(frame, "ENTER: Jogar", (btn1_x + 15, btn_y + 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-    # Sair
     btn2_x = (w // 2) + 20
     cv2.rectangle(frame, (btn2_x, btn_y), (btn2_x + 150, btn_y + 45),
                   (0, 0, 160), -1, cv2.LINE_AA)
@@ -421,26 +394,34 @@ def draw_results_screen(frame, records, player_name, player_score):
 
 
 # =============================================================================
-#  Loop principal com máquina de estados de telas
+#  Loop principal com máquina de estados de telas + YOLO Pose tracking
 # =============================================================================
 def main():
-    global latest_landmarks
+    # ── Inicializar YOLO Pose tracker + smoother ──
+    tracker = PoseTracker()
+    smoother = KeypointSmoother(alpha=cfg.SMOOTHING_ALPHA)
 
     webcam = cv2.VideoCapture(0)
+    webcam.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.CAPTURE_WIDTH)
+    webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.CAPTURE_HEIGHT)
+
+    # Configurar janela em tela cheia
+    window_name = "Six Seven Challenge"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     # Estado das telas
     current_screen = SCREEN_START
     player_name = ""
     cursor_blink_time = time.time()
 
-    # Estado do jogo
+    # Estado do jogo (original wrist-based)
     transitions = deque(maxlen=8)
     last_state = NEUTRAL
     last_transition_time = 0.0
     gesture_count = 0
     gesture_flash_time = 0.0
     game_start_time = 0.0
-    frame_ts = 0
     prev_wl_y = None  # Y do pulso esquerdo na última transição
     prev_wr_y = None  # Y do pulso direito na última transição
 
@@ -448,7 +429,7 @@ def main():
     records = load_records()
     player_score = 0
 
-    print("Iniciando Six Seven Challenge...")
+    print("Iniciando Six Seven Challenge (YOLO Pose)...")
     print("Pressione 'q' para sair.\n")
 
     while True:
@@ -456,14 +437,27 @@ def main():
         if not success:
             continue
 
-        frame = cv2.flip(frame, 1)
-        now = time.time()
+        if cfg.MIRROR_MODE:
+            frame = cv2.flip(frame, 1)
 
-        # Enviar frame para o PoseLandmarker (sempre, para manter o feed ativo)
-        frame_ts += 1
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        landmarker.detect_async(mp_image, frame_ts)
+        # Redimensionar frame para preencher a tela
+        rect = cv2.getWindowImageRect(window_name)
+        screen_w = int(rect[2]) if rect[2] > 0 else frame.shape[1]
+        screen_h = int(rect[3]) if rect[3] > 0 else frame.shape[0]
+        if screen_w > 0 and screen_h > 0:
+            frame = cv2.resize(frame, (screen_w, screen_h))
+
+        now = time.time()
+        h_frame = frame.shape[0]
+
+        # ── YOLO Pose inference (sempre, para manter feed ativo) ──
+        raw_kps = tracker.process(frame)
+        kps = None
+        if raw_kps is not None:
+            kps = filter_keypoints(raw_kps)
+            kps = smoother.smooth(kps)
+        else:
+            smoother.reset()
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -484,6 +478,7 @@ def main():
                 last_transition_time = 0.0
                 prev_wl_y = None
                 prev_wr_y = None
+                smoother.reset()
                 print(f"Jogo iniciado! Jogador: {player_name}")
             elif key == 8:  # Backspace
                 player_name = player_name[:-1]
@@ -507,46 +502,51 @@ def main():
                 current_screen = SCREEN_RESULTS
                 print(f"Tempo esgotado! {player_name}: {player_score} pontos")
             else:
-                # Processar detecção de pose
-                if latest_landmarks is not None:
-                    lm = latest_landmarks
-                    draw_skeleton(frame, lm)
-                    draw_reference_lines(frame, lm)
-                    state = classify_frame(lm)
+                # Processar detecção de pose com YOLO
+                if kps is not None and len(kps) > 0:
+                    # Desenhar esqueleto e caixas das mãos
+                    draw_skeleton_yolo(frame, kps)
+                    body_scale = shoulder_distance(kps) or 150.0
+                    draw_hand_boxes_yolo(frame, kps, body_scale)
 
-                    # Máquina de estados do gesto
-                    cur_wl_y = lm[LEFT_WRIST].y
-                    cur_wr_y = lm[RIGHT_WRIST].y
+                    # Classificar frame (lógica original baseada em pulsos)
+                    state = classify_frame_yolo(kps, h_frame)
 
-                    if state in (A_UP_B_DOWN, B_UP_A_DOWN):
-                        if state != last_state and (now - last_transition_time) > DEBOUNCE_SEC:
-                            # Verificar se AMBOS os pulsos se movimentaram
-                            both_moved = True
-                            if prev_wl_y is not None and prev_wr_y is not None:
-                                wl_delta = abs(cur_wl_y - prev_wl_y)
-                                wr_delta = abs(cur_wr_y - prev_wr_y)
-                                both_moved = (wl_delta >= MIN_WRIST_MOVEMENT and
-                                              wr_delta >= MIN_WRIST_MOVEMENT)
+                    # Máquina de estados do gesto (original)
+                    wl = kps.get("left_wrist")
+                    wr = kps.get("right_wrist")
+                    if wl is not None and wr is not None:
+                        cur_wl_y = wl[1]
+                        cur_wr_y = wr[1]
 
-                            if both_moved:
-                                transitions.append((state, now))
-                                last_state = state
-                                last_transition_time = now
-                                prev_wl_y = cur_wl_y
-                                prev_wr_y = cur_wr_y
+                        if state in (A_UP_B_DOWN, B_UP_A_DOWN):
+                            if state != last_state and (now - last_transition_time) > DEBOUNCE_SEC:
+                                # Verificar se AMBOS os pulsos se movimentaram
+                                both_moved = True
+                                if prev_wl_y is not None and prev_wr_y is not None:
+                                    wl_delta = abs(cur_wl_y - prev_wl_y)
+                                    wr_delta = abs(cur_wr_y - prev_wr_y)
+                                    both_moved = (wl_delta >= MIN_WRIST_MOVEMENT and
+                                                  wr_delta >= MIN_WRIST_MOVEMENT)
 
-                                if check_six_seven(transitions):
-                                    gesture_count += 1
-                                    gesture_flash_time = now
-                                    transitions.clear()
-                                    last_state = NEUTRAL
-                                    prev_wl_y = None
-                                    prev_wr_y = None
-                                    print(f"[SIX SEVEN] +1! Total: {gesture_count}")
+                                if both_moved:
+                                    transitions.append((state, now))
+                                    last_state = state
+                                    last_transition_time = now
+                                    prev_wl_y = cur_wl_y
+                                    prev_wr_y = cur_wr_y
 
+                                    if check_six_seven(transitions):
+                                        gesture_count += 1
+                                        gesture_flash_time = now
+                                        transitions.clear()
+                                        last_state = NEUTRAL
+                                        prev_wl_y = None
+                                        prev_wr_y = None
+                                        print(f"[SIX SEVEN] +1! Total: {gesture_count}")
 
                 flash_remaining = max(0, FLASH_DURATION_SEC - (now - gesture_flash_time))
-                draw_game_hud(frame, state, gesture_count, len(transitions),
+                draw_game_hud(frame, state, gesture_count,
                               flash_remaining, max(0, remaining), player_name)
 
             if key == ord("q"):
@@ -565,11 +565,10 @@ def main():
             elif key == ord("q"):
                 break
 
-        cv2.imshow("Six Seven Challenge", frame)
+        cv2.imshow(window_name, frame)
 
     webcam.release()
     cv2.destroyAllWindows()
-    landmarker.close()
     print(f"\nSessao encerrada.")
 
 
