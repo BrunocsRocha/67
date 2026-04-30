@@ -682,7 +682,6 @@ def main():
                                         last_state = NEUTRAL
                                         prev_wl_y = None
                                         prev_wr_y = None
-                                        print(f"[SIX SEVEN] +1! Total: {gesture_count}")
 
                 flash_remaining = max(0, FLASH_DURATION_SEC - (now - gesture_flash_time))
                 draw_game_hud(frame, state, gesture_count,
