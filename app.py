@@ -74,6 +74,7 @@ RHYTHM_TOLERANCE = 0.70
 MIN_TRANSITIONS = 2
 FLASH_DURATION_SEC = 0.6
 MIN_VISIBILITY = 0.35
+MIN_WRIST_MOVEMENT = 0.03  # Movimento mínimo de cada pulso (3% da altura normalizada)
 
 # =============================================================================
 #  Estado global (atualizado pelo callback do LIVE_STREAM)
@@ -140,29 +141,26 @@ def update_records(records, name, score):
 #  Funções de detecção de gesto
 # =============================================================================
 def classify_frame(landmarks):
-    """Classifica o frame baseado na posição relativa dos pulsos."""
+    """Classifica o frame baseado na posição relativa entre os dois pulsos.
+
+    Quando o pulso esquerdo está mais alto (menor Y) que o direito → L_UP_R_DOWN.
+    Quando o pulso direito está mais alto que o esquerdo → R_UP_L_DOWN.
+    Margem de histerese para evitar oscilação quando estão na mesma altura.
+    """
     wl = landmarks[LEFT_WRIST]
     wr = landmarks[RIGHT_WRIST]
-    sl = landmarks[LEFT_SHOULDER]
-    sr = landmarks[RIGHT_SHOULDER]
-    hl = landmarks[LEFT_HIP]
-    hr = landmarks[RIGHT_HIP]
 
     if wl.visibility < MIN_VISIBILITY or wr.visibility < MIN_VISIBILITY:
         return NEUTRAL
 
-    shoulder_y = (sl.y + sr.y) / 2
-    hip_y = (hl.y + hr.y) / 2
-    chest_y = (shoulder_y + hip_y) / 2
+    # Margem de histerese (5% da altura normalizada)
+    MARGIN = 0.05
+    diff = wl.y - wr.y  # positivo = esquerdo mais baixo, negativo = esquerdo mais alto
 
-    wl_y, wr_y = wl.y, wr.y
-
-    if wl_y < shoulder_y and wr_y < shoulder_y:
-        return BOTH_UP
-    if wl_y < shoulder_y and wr_y > chest_y:
-        return A_UP_B_DOWN
-    if wr_y < shoulder_y and wl_y > chest_y:
-        return B_UP_A_DOWN
+    if diff < -MARGIN:
+        return A_UP_B_DOWN   # Pulso esquerdo mais alto
+    if diff > MARGIN:
+        return B_UP_A_DOWN   # Pulso direito mais alto
 
     return NEUTRAL
 
@@ -443,6 +441,8 @@ def main():
     gesture_flash_time = 0.0
     game_start_time = 0.0
     frame_ts = 0
+    prev_wl_y = None  # Y do pulso esquerdo na última transição
+    prev_wr_y = None  # Y do pulso direito na última transição
 
     # Recordes
     records = load_records()
@@ -482,6 +482,8 @@ def main():
                 transitions.clear()
                 last_state = NEUTRAL
                 last_transition_time = 0.0
+                prev_wl_y = None
+                prev_wr_y = None
                 print(f"Jogo iniciado! Jogador: {player_name}")
             elif key == 8:  # Backspace
                 player_name = player_name[:-1]
@@ -513,21 +515,35 @@ def main():
                     state = classify_frame(lm)
 
                     # Máquina de estados do gesto
+                    cur_wl_y = lm[LEFT_WRIST].y
+                    cur_wr_y = lm[RIGHT_WRIST].y
+
                     if state in (A_UP_B_DOWN, B_UP_A_DOWN):
                         if state != last_state and (now - last_transition_time) > DEBOUNCE_SEC:
-                            transitions.append((state, now))
-                            last_state = state
-                            last_transition_time = now
+                            # Verificar se AMBOS os pulsos se movimentaram
+                            both_moved = True
+                            if prev_wl_y is not None and prev_wr_y is not None:
+                                wl_delta = abs(cur_wl_y - prev_wl_y)
+                                wr_delta = abs(cur_wr_y - prev_wr_y)
+                                both_moved = (wl_delta >= MIN_WRIST_MOVEMENT and
+                                              wr_delta >= MIN_WRIST_MOVEMENT)
 
-                            if check_six_seven(transitions):
-                                gesture_count += 1
-                                gesture_flash_time = now
-                                transitions.clear()
-                                last_state = NEUTRAL
-                                print(f"[SIX SEVEN] +1! Total: {gesture_count}")
-                    elif state == BOTH_UP:
-                        transitions.clear()
-                        last_state = NEUTRAL
+                            if both_moved:
+                                transitions.append((state, now))
+                                last_state = state
+                                last_transition_time = now
+                                prev_wl_y = cur_wl_y
+                                prev_wr_y = cur_wr_y
+
+                                if check_six_seven(transitions):
+                                    gesture_count += 1
+                                    gesture_flash_time = now
+                                    transitions.clear()
+                                    last_state = NEUTRAL
+                                    prev_wl_y = None
+                                    prev_wr_y = None
+                                    print(f"[SIX SEVEN] +1! Total: {gesture_count}")
+
 
                 flash_remaining = max(0, FLASH_DURATION_SEC - (now - gesture_flash_time))
                 draw_game_hud(frame, state, gesture_count, len(transitions),
